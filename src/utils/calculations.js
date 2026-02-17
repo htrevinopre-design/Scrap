@@ -1,151 +1,98 @@
-import isriCategories from '../data/isriCategories';
-import { getCurrentPrice, getAvg7DayPrice, getAvg30DayPrice } from '../data/mockPrices';
+import { getCategoryByCode } from '../data/isriCategories';
+import { getFastmarketsPrice } from '../data/mockFastmarkets';
 
-function getCategoryByCode(code) {
-  return isriCategories.find((c) => c.code === code);
+export function calcularDiasInventario(dateAcquired) {
+  return Math.floor((new Date() - new Date(dateAcquired)) / (1000 * 60 * 60 * 24));
+}
+
+export function calcularMargen(costPerLb, marketPrice) {
+  if (marketPrice === 0) return 0;
+  return ((marketPrice - costPerLb) / marketPrice) * 100;
+}
+
+export function enrichInventoryItem(item) {
+  const cat = getCategoryByCode(item.material);
+  if (!cat) return null;
+  const fm = getFastmarketsPrice(item.material);
+  const marketPrice = fm ? fm.avg : cat.basePriceUSD;
+  const days = calcularDiasInventario(item.dateAcquired);
+  const margin = calcularMargen(item.avgCostPerLb, marketPrice);
+  const currentValue = item.weightLbs * marketPrice;
+  const totalCost = item.weightLbs * item.avgCostPerLb;
+  const potentialProfit = currentValue - totalCost;
+
+  let recommendation = 'HOLD';
+  let recommendationReason = 'Sin señal clara';
+
+  if (margin > 12 && days > 7) {
+    recommendation = 'SELL';
+    recommendationReason = `Margen ${margin.toFixed(1)}% con ${days}d en inventario`;
+  } else if (margin > 8 && marketPrice > cat.basePriceUSD) {
+    recommendation = 'SELL';
+    recommendationReason = `Precio arriba de referencia, margen ${margin.toFixed(1)}%`;
+  } else if (days > 30) {
+    recommendation = 'WATCH';
+    recommendationReason = `${days} días — rotación lenta, considerar liquidar`;
+  } else if (margin < 5) {
+    recommendation = 'HOLD';
+    recommendationReason = `Margen bajo (${margin.toFixed(1)}%), esperar mejor precio`;
+  }
+
+  return {
+    ...item,
+    category: cat,
+    marketPrice,
+    currentValue,
+    totalCost,
+    potentialProfit,
+    margin,
+    days,
+    recommendation,
+    recommendationReason,
+  };
 }
 
 export function calcularValorInventario(inventory) {
   return inventory.reduce((total, item) => {
-    const cat = getCategoryByCode(item.categoryCode);
-    if (!cat) return total;
-    const marketPrice = getCurrentPrice(cat.metalBase) * (cat.purity / 100);
-    return total + item.weightLbs * marketPrice;
+    const enriched = enrichInventoryItem(item);
+    return total + (enriched ? enriched.currentValue : 0);
   }, 0);
 }
 
-export function calcularValorInventarioAnterior(inventory) {
-  // Simulated: use 7-day average as "last week" value
-  return inventory.reduce((total, item) => {
-    const cat = getCategoryByCode(item.categoryCode);
-    if (!cat) return total;
-    const avgPrice = getAvg7DayPrice(cat.metalBase) * (cat.purity / 100);
-    return total + item.weightLbs * avgPrice;
-  }, 0);
-}
-
-export function calcularMargen(costoCompra, precioMercado) {
-  if (precioMercado === 0) return 0;
-  return ((precioMercado - costoCompra) / precioMercado) * 100;
-}
-
-export function calcularDiasInventario(fechaEntrada) {
-  const entry = new Date(fechaEntrada);
-  const today = new Date();
-  return Math.floor((today - entry) / (1000 * 60 * 60 * 24));
+export function calcularCostoInventario(inventory) {
+  return inventory.reduce((total, item) => total + item.weightLbs * item.avgCostPerLb, 0);
 }
 
 export function calcularMargenPromedio(inventory) {
-  if (inventory.length === 0) return 0;
-  let totalMargen = 0;
-  let count = 0;
-  inventory.forEach((item) => {
-    const cat = getCategoryByCode(item.categoryCode);
-    if (!cat) return;
-    const marketPrice = getCurrentPrice(cat.metalBase) * (cat.purity / 100);
-    totalMargen += calcularMargen(item.costPerLb, marketPrice);
-    count++;
-  });
-  return count > 0 ? totalMargen / count : 0;
+  const items = inventory.map(enrichInventoryItem).filter(Boolean);
+  if (items.length === 0) return 0;
+  return items.reduce((s, i) => s + i.margin, 0) / items.length;
 }
 
 export function calcularDiasPromedioInventario(inventory) {
   if (inventory.length === 0) return 0;
-  const totalDays = inventory.reduce(
-    (sum, item) => sum + calcularDiasInventario(item.entryDate),
-    0
-  );
-  return Math.round(totalDays / inventory.length);
-}
-
-export function convertirMoneda(valorUSD, moneda, tipoCambio = 17.5) {
-  return moneda === 'MXN' ? valorUSD * tipoCambio : valorUSD;
+  const total = inventory.reduce((s, i) => s + calcularDiasInventario(i.dateAcquired), 0);
+  return Math.round(total / inventory.length);
 }
 
 export function getInventoryByMetal(inventory) {
   const grouped = {};
   inventory.forEach((item) => {
-    const cat = getCategoryByCode(item.categoryCode);
-    if (!cat) return;
-    const metal = cat.metalBase;
-    const marketPrice = getCurrentPrice(metal) * (cat.purity / 100);
-    const value = item.weightLbs * marketPrice;
-    if (!grouped[metal]) grouped[metal] = { weight: 0, value: 0 };
+    const enriched = enrichInventoryItem(item);
+    if (!enriched) return;
+    const metal = enriched.category.metalBase;
+    if (!grouped[metal]) grouped[metal] = { weight: 0, value: 0, cost: 0 };
     grouped[metal].weight += item.weightLbs;
-    grouped[metal].value += value;
+    grouped[metal].value += enriched.currentValue;
+    grouped[metal].cost += enriched.totalCost;
   });
   return grouped;
 }
 
-export function getMarginByCategory(inventory) {
-  return inventory
-    .map((item) => {
-      const cat = getCategoryByCode(item.categoryCode);
-      if (!cat) return null;
-      const marketPrice = getCurrentPrice(cat.metalBase) * (cat.purity / 100);
-      const margin = calcularMargen(item.costPerLb, marketPrice);
-      const days = calcularDiasInventario(item.entryDate);
-      const potentialProfit = (marketPrice - item.costPerLb) * item.weightLbs;
-      return {
-        ...item,
-        category: cat,
-        marketPrice,
-        margin,
-        days,
-        potentialProfit,
-      };
-    })
-    .filter(Boolean);
-}
-
-export function generateAlerts(inventory) {
-  const alerts = [];
-  const enriched = getMarginByCategory(inventory);
-
-  enriched.forEach((item) => {
-    const cat = item.category;
-    const avg30 = getAvg30DayPrice(cat.metalBase) * (cat.purity / 100);
-    const current = item.marketPrice;
-
-    let type, reason;
-
-    if (item.margin > 15 && item.days > 14) {
-      type = 'VENDER';
-      reason = `Margen ${item.margin.toFixed(1)}% con ${item.days} días en inventario`;
-    } else if (item.margin > 10 && current > avg30) {
-      type = 'CONSIDERAR VENTA';
-      reason = `Precio actual sobre promedio 30d, margen ${item.margin.toFixed(1)}%`;
-    } else if (item.days > 30) {
-      type = 'ROTAR';
-      reason = `${item.days} días en inventario, rotación lenta`;
-    } else if (current < avg30 && item.margin < 10) {
-      type = 'MANTENER';
-      reason = `Precio bajo promedio, esperar recuperación`;
-    } else {
-      return;
-    }
-
-    alerts.push({
-      id: item.id,
-      type,
-      reason,
-      categoryCode: cat.code,
-      categoryName: cat.commonName,
-      metalBase: cat.metalBase,
-      weightLbs: item.weightLbs,
-      margin: item.margin,
-      potentialProfit: item.potentialProfit,
-    });
-  });
-
-  // Sort: VENDER first, then CONSIDERAR, then ROTAR, then MANTENER
-  const order = { VENDER: 0, 'CONSIDERAR VENTA': 1, ROTAR: 2, MANTENER: 3 };
-  return alerts.sort((a, b) => order[a.type] - order[b.type]);
-}
-
-export function calcularTendencia(metalBase) {
-  const current = getCurrentPrice(metalBase);
-  const avg7 = getAvg7DayPrice(metalBase);
-  if (avg7 === 0) return 0;
-  return ((current - avg7) / avg7) * 100;
+export function getVentasDelMes(transactions) {
+  const now = new Date();
+  const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+  return transactions
+    .filter((t) => t.type === 'sale' && t.date >= firstOfMonth)
+    .reduce((s, t) => s + t.totalAmount, 0);
 }
